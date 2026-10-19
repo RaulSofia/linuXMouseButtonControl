@@ -1,0 +1,11 @@
+[Unit]
+Description=linuXMouseButtonControl (lxmbc) - XMBC-style chords and pan for mice
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/lxmbc --config /etc/lxmbc.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
