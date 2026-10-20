@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install or update linuXMouseButtonControl (lxmbc).  Run from this folder:  sudo bash install.sh
-# Safe to re-run after editing lxmbc.py: it reinstalls and restarts the service if it is running.
-# Your /etc/lxmbc.conf is kept; add --reset-config to replace it with this folder's defaults.
+# Safe to re-run after editing lxmbc.py or pulling a new version: it reinstalls the program
+# and restarts the service if it is running. Your /etc/lxmbc.conf is never overwritten.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo:  sudo bash install.sh"; exit 1; }
@@ -22,15 +22,17 @@ fi
 
 install -m 755 lxmbc.py /usr/local/bin/lxmbc
 install -m 644 lxmbc.service /etc/systemd/system/lxmbc.service
-if [ "${1:-}" = "--reset-config" ] && [ -e /etc/lxmbc.conf ]; then
-  cp /etc/lxmbc.conf /etc/lxmbc.conf.bak
-  install -m 644 lxmbc.conf /etc/lxmbc.conf
-  echo "Replaced /etc/lxmbc.conf with the defaults (old one saved as /etc/lxmbc.conf.bak)."
-elif [ -e /etc/lxmbc.conf ]; then
-  echo "Kept your existing /etc/lxmbc.conf (your tuning is preserved)."
-  echo "To take the new defaults instead:  sudo bash install.sh --reset-config"
+
+# Config: create it on first install only. Defaults live in the program itself, so new
+# settings in future versions work without touching this file.
+if [ ! -e /etc/lxmbc.conf ]; then
+  install -m 644 lxmbc.conf.example /etc/lxmbc.conf
+  echo "Created /etc/lxmbc.conf (all settings at their defaults; edit it to change any)."
+elif ! grep -q "lxmbc-config-format: 2" /etc/lxmbc.conf; then
+  # One-time conversion of configs from earlier versions, which listed every setting.
+  PYTHONDONTWRITEBYTECODE=1 python3 lxmbc.py --config /etc/lxmbc.conf --upgrade-config lxmbc.conf.example
 else
-  install -m 644 lxmbc.conf /etc/lxmbc.conf
+  echo "Kept your /etc/lxmbc.conf."
 fi
 systemctl daemon-reload
 

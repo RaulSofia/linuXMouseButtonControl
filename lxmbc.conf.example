@@ -1,0 +1,57 @@
+# lxmbc (linuXMouseButtonControl) configuration
+#
+# THIS IS AN EXAMPLE. The live config is /etc/lxmbc.conf: edit that one, e.g.
+#     sudoedit /etc/lxmbc.conf
+# and then apply it with
+#     sudo systemctl restart lxmbc
+#
+# Every setting below is commented out and shows its default. To change one, remove
+# the leading # and edit the value. Settings left commented keep their defaults, and
+# new settings added in future versions get sensible defaults automatically.
+#
+# lxmbc-config-format: 2
+
+[lxmbc]
+
+# Which mice to grab: comma-separated parts of device names (see: sudo lxmbc --list).
+# Empty = every mouse, including ones plugged in later. Once set, only listed mice are grabbed.
+#devices =
+
+# Pan chord timing: how long (ms) a Left press waits for Right to form the chord.
+# Raise if Left-then-Right chords get missed. Quick left clicks are not delayed by this;
+# it only delays a left press held perfectly still. 0 = no timeout (pure release-only:
+# chords never miss, but press-and-hold on scrollbars/spin buttons becomes a single click).
+#chord_ms = 200
+
+# Pan chord tolerance: how far (mouse counts) the mouse may move while you press the
+# second button. Raise if chords turn into drags; lower if right-drags feel late to start.
+#chord_move_threshold = 25
+
+# How far (mouse counts) a held Middle can move before it counts as a drag
+# (VS Code box select, PDF pan). Keep it small.
+#move_threshold = 4
+
+# How the pan reaches apps:
+#   wheel     as wheel scrolling. Works everywhere, but apps animate it, so it can feel soft.
+#   touchpad  EXPERIMENTAL. As a two-finger drag on a virtual touchpad. Apps treat touchpad
+#             scrolling as precise (1:1, no smoothing). The direction follows GNOME's touchpad
+#             "Natural Scrolling" setting (on by default = page follows your hand).
+#pan_mode = wheel
+
+# Pan speed in wheel mode: hi-res scroll units per mouse count (120 units = one wheel notch).
+# Raise if the page lags behind your hand, lower if it runs ahead.
+#pan_speed = 2.25
+
+# Pan speed in touchpad mode: touchpad units per mouse count. Same idea as pan_speed.
+#touchpad_speed = 1.0
+
+# yes = the page follows your hand (grab-and-drag, like XMBC with inverted axes).
+# no  = scrollbar direction.
+#pan_follow_hand = yes
+
+# yes = the cursor keeps moving during a pan (like Brave's PDF pan), no = it stays put.
+# Note: scrolling goes to the window under the cursor, so it can switch windows mid-pan.
+#pan_move_cursor = no
+
+# Hold Back this long (ms) to open the GNOME overview instead of going back.
+#back_hold_ms = 200

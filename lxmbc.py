@@ -2,8 +2,16 @@
 """linuXMouseButtonControl (lxmbc) - XMBC-style button chords, pan and button tricks for Linux mice.
 
 Grabs physical mice through evdev, runs their events through a small state
-machine (Engine) and re-emits the result through two virtual devices (uinput):
-a mouse and a keyboard (for shortcuts such as Ctrl+Tab).
+machine (Engine) and re-emits the result through virtual devices (uinput):
+a mouse, a keyboard (for shortcuts such as Ctrl+Tab) and, with
+pan_mode = touchpad, a touchpad.
+
+Pan modes:
+  wheel     the pan is sent as (hi-res) wheel scrolling. Works everywhere, but apps
+            animate wheel scrolling, so it can feel soft.
+  touchpad  EXPERIMENTAL. The pan is sent as a two-finger drag on a virtual touchpad.
+            Apps treat touchpad scrolling as precise (1:1, no smoothing), like
+            dragging the page directly.
 
 Default behaviour:
   Right then Left, or Left then Right within chord_ms, + move  -> pan (page follows hand)
@@ -26,11 +34,13 @@ and later ported (e.g. into Input Remapper). The I/O layer lives in main().
 
 import argparse
 import configparser
+import os
+import re
 import select
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # --- Linux input event codes (linux/input-event-codes.h) ---------------------
 EV_SYN, EV_KEY, EV_REL = 0x00, 0x01, 0x02
@@ -47,22 +57,43 @@ REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES = 0x0B, 0x0C
 KEY_TAB, KEY_LEFTCTRL, KEY_LEFTSHIFT = 15, 29, 42
 KEY_KPMINUS, KEY_KPPLUS, KEY_LEFTMETA = 74, 78, 125
 
+# Touchpad (pan_mode = touchpad)
+EV_ABS = 0x03
+ABS_X, ABS_Y = 0x00, 0x01
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x35, 0x36, 0x39
+BTN_TOOL_FINGER, BTN_TOUCH = 0x145, 0x14A
+BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP = 0x14D, 0x14E
+INPUT_PROP_POINTER, INPUT_PROP_BUTTONPAD = 0x00, 0x02
+TP_RES = 40                     # units per mm (~1000 dpi, so 1 mouse count ~ 1 touchpad unit)
+TP_MAX = 20000                  # 500 mm square: plenty of room before a re-grip
+TP_CENTER = TP_MAX // 2
+TP_GAP = 400                    # 10 mm between the two fingers
+TP_MARGIN = 1000                # re-grip (lift and touch down again) this close to an edge
+TP_HOLD_S = 0.06                # keep fingers still before lifting, so apps see no fling
+TP_MIN_TOUCH_S = 0.25           # never lift sooner than this, so it can't count as a 2-finger tap
+
 HI_RES_PER_NOTCH = 120
 
-MOUSE, KBD = "mouse", "keyboard"            # output targets
+MOUSE, KBD, TP = "mouse", "keyboard", "touchpad"   # output targets
 HELD = (BTN_RIGHT, BTN_MIDDLE, BTN_EXTRA)   # buttons held back until release/move/wheel
 NAMES = {BTN_LEFT: "left", BTN_RIGHT: "right", BTN_MIDDLE: "middle",
          BTN_SIDE: "back", BTN_EXTRA: "forward"}
 
 
 # --- Configuration -------------------------------------------------------------
+# The ONLY place defaults are defined. /etc/lxmbc.conf holds just the settings you
+# change; anything missing there falls back to these values.
+CONFIG_FORMAT_MARKER = "lxmbc-config-format: 2"
 DEFAULTS = {
     "devices": "",
     "chord_ms": "200",
     "chord_move_threshold": "25",
     "move_threshold": "4",
+    "pan_mode": "wheel",
     "pan_speed": "2.25",
+    "touchpad_speed": "1.0",
     "pan_follow_hand": "yes",
+    "pan_move_cursor": "no",
     "back_hold_ms": "200",
 }
 
@@ -73,28 +104,87 @@ class Config:
     chord_ms: float
     chord_move_threshold: int
     move_threshold: int
+    pan_mode: str
     pan_speed: float
+    touchpad_speed: float
     pan_follow_hand: bool
+    pan_move_cursor: bool
     back_hold_ms: float
     debug: bool = False
+    overrides: dict = field(default_factory=dict)   # settings changed in the config file
+    unknown: list = field(default_factory=list)     # unrecognised names (typos)
+
+
+def _pan_mode(value):
+    value = value.strip().lower()
+    if value not in ("wheel", "touchpad"):
+        raise ValueError(f"pan_mode must be 'wheel' or 'touchpad', not {value!r}")
+    return value
+
+
+_CONVERTERS = {
+    "devices": lambda v: [d.strip() for d in v.split(",") if d.strip()],
+    "chord_ms": float, "chord_move_threshold": int, "move_threshold": int,
+    "pan_mode": _pan_mode, "pan_speed": float, "touchpad_speed": float,
+    "pan_follow_hand": lambda v: _bool(v), "pan_move_cursor": lambda v: _bool(v),
+    "back_hold_ms": float,
+}
+
+
+def _bool(value):
+    states = configparser.ConfigParser.BOOLEAN_STATES
+    if value.strip().lower() not in states:
+        raise ValueError(f"expected yes/no, not {value!r}")
+    return states[value.strip().lower()]
+
+
+def _read_file(path):
+    """Settings actually written in a config file (no defaults mixed in)."""
+    cp = configparser.ConfigParser()
+    if path and os.path.exists(path):
+        cp.read(path)
+    return dict(cp["lxmbc"]) if cp.has_section("lxmbc") else {}
 
 
 def load_config(path=None, debug=False):
+    in_file = _read_file(path)
     cp = configparser.ConfigParser()
     cp.read_dict({"lxmbc": DEFAULTS})
-    if path:
-        cp.read(path)
+    cp.read_dict({"lxmbc": {k: v for k, v in in_file.items() if k in DEFAULTS}})
     s = cp["lxmbc"]
     return Config(
         devices=[d.strip() for d in s.get("devices").split(",") if d.strip()],
         chord_ms=s.getfloat("chord_ms"),
         chord_move_threshold=s.getint("chord_move_threshold"),
         move_threshold=s.getint("move_threshold"),
+        pan_mode=_pan_mode(s.get("pan_mode")),
         pan_speed=s.getfloat("pan_speed"),
+        touchpad_speed=s.getfloat("touchpad_speed"),
         pan_follow_hand=s.getboolean("pan_follow_hand"),
+        pan_move_cursor=s.getboolean("pan_move_cursor"),
         back_hold_ms=s.getfloat("back_hold_ms"),
         debug=debug,
+        overrides={k: v for k, v in in_file.items() if k in DEFAULTS},
+        unknown=sorted(k for k in in_file if k not in DEFAULTS),
     )
+
+
+def upgrade_config(old_path, example_text):
+    """Convert an old-style config (every setting written out) into the new style:
+    the example file with only the settings that differ from DEFAULTS uncommented.
+    Returns (new_text, kept) where kept maps setting -> value."""
+    old = _read_file(old_path)
+    kept = {}
+    for key, value in old.items():
+        if key in DEFAULTS and _CONVERTERS[key](value) != _CONVERTERS[key](DEFAULTS[key]):
+            kept[key] = value
+    text = example_text
+    for key, value in kept.items():
+        text, n = re.subn(rf"^#\s*{re.escape(key)}\s*=.*$", f"{key} = {value}", text,
+                          count=1, flags=re.M)
+        if not n:
+            raise ValueError(f"{key} not found in the example config")
+    return text, kept
 
 
 # --- State machine -------------------------------------------------------------
@@ -122,6 +212,14 @@ class Engine:
         self.swallow = set()        # buttons whose next release must be eaten
         self._rem = [0.0, 0.0]      # fractional hi-res scroll remainder (v, h)
         self._acc = [0, 0]          # hi-res units accumulated toward a legacy notch
+        self.now = 0.0
+        # virtual touchpad (pan_mode = touchpad)
+        self.touching = False
+        self.tp_pos = [TP_CENTER, TP_CENTER]   # first finger (x, y); second is TP_GAP to the right
+        self.tp_rem = [0.0, 0.0]
+        self.touch_time = 0.0
+        self.lift_deadline = None
+        self.tid = 0
 
     # -- output helpers --
     @staticmethod
@@ -187,6 +285,7 @@ class Engine:
 
     # -- public API --
     def feed(self, etype, code, value, now):
+        self.now = now
         if etype == EV_KEY:
             if value == 2:          # autorepeat, not meaningful for mouse buttons
                 return []
@@ -200,7 +299,10 @@ class Engine:
         return []                   # EV_MSC (scan codes) etc. are not forwarded
 
     def tick(self, now):
+        self.now = now
         out = []
+        if self.touching and self.lift_deadline is not None and now >= self.lift_deadline:
+            out += self._tp_up()
         if self.left == "pending" and now >= self.left_deadline:
             out += self._commit_left()
         if self.side == "pending" and now >= self.side_deadline:
@@ -215,6 +317,8 @@ class Engine:
             ds.append(self.left_deadline)
         if self.side == "pending":
             ds.append(self.side_deadline)
+        if self.touching and self.lift_deadline is not None:
+            ds.append(self.lift_deadline)
         return min(ds) if ds else None
 
     def release_all(self):
@@ -225,6 +329,8 @@ class Engine:
         for c, st in self.held.items():
             if st == "down":
                 out += self._btn(c, 0)
+        if self.touching:
+            out += self._tp_up()
         self.__init__(self.cfg, self.log)
         return out
 
@@ -237,6 +343,9 @@ class Engine:
         self.swallow.update((BTN_LEFT, BTN_RIGHT))
         self._rem = [0.0, 0.0]
         self._acc = [0, 0]
+        self.tp_rem = [0.0, 0.0]
+        if self.touching:               # fingers still down from the previous pan: carry on
+            self.lift_deadline = None
         self.log("pan: start")
         return []
 
@@ -286,6 +395,9 @@ class Engine:
             if self.pan and code in (BTN_LEFT, BTN_RIGHT):
                 self.pan = False
                 self.log(f"pan: end ({NAMES[code]} released)")
+                if self.touching:
+                    self.lift_deadline = max(self.now + TP_HOLD_S,
+                                             self.touch_time + TP_MIN_TOUCH_S)
             return []
 
         if code == BTN_LEFT:
@@ -319,7 +431,11 @@ class Engine:
     # -- motion --
     def _motion(self, code, value):
         if self.pan:
-            return self._pan(code, value)
+            out = (self._tp_move(code, value) if self.cfg.pan_mode == "touchpad"
+                   else self._pan(code, value))
+            if self.cfg.pan_move_cursor:
+                out.append((MOUSE, EV_REL, code, value))
+            return out
         out = []
         # Right gets the generous chord tolerance (your hand moves while reaching for Left);
         # Middle keeps a tight threshold so VS Code box select starts right away.
@@ -361,6 +477,59 @@ class Engine:
             self._acc[idx] -= notches * HI_RES_PER_NOTCH
             out.append((MOUSE, EV_REL, lo, notches))
         return out
+
+    # -- virtual touchpad: the pan as a two-finger drag --
+    def _tp_frame(self):
+        x, y = self.tp_pos
+        return [(TP, EV_ABS, ABS_MT_SLOT, 0),
+                (TP, EV_ABS, ABS_MT_POSITION_X, x), (TP, EV_ABS, ABS_MT_POSITION_Y, y),
+                (TP, EV_ABS, ABS_MT_SLOT, 1),
+                (TP, EV_ABS, ABS_MT_POSITION_X, x + TP_GAP), (TP, EV_ABS, ABS_MT_POSITION_Y, y),
+                (TP, EV_ABS, ABS_X, x), (TP, EV_ABS, ABS_Y, y)]
+
+    def _tp_down(self):
+        self.tid = (self.tid + 2) % 65534
+        self.tp_pos = [TP_CENTER, TP_CENTER]
+        self.touching = True
+        self.touch_time = self.now
+        self.lift_deadline = None
+        self.log("pan: two fingers down on virtual touchpad")
+        return ([(TP, EV_ABS, ABS_MT_SLOT, 0), (TP, EV_ABS, ABS_MT_TRACKING_ID, self.tid),
+                 (TP, EV_ABS, ABS_MT_SLOT, 1), (TP, EV_ABS, ABS_MT_TRACKING_ID, self.tid + 1)]
+                + self._tp_frame()
+                + [(TP, EV_KEY, BTN_TOUCH, 1), (TP, EV_KEY, BTN_TOOL_DOUBLETAP, 1),
+                   (TP, EV_SYN, SYN_REPORT, 0)])
+
+    def _tp_up(self):
+        self.touching = False
+        self.lift_deadline = None
+        self.log("pan: fingers lifted")
+        return [(TP, EV_ABS, ABS_MT_SLOT, 0), (TP, EV_ABS, ABS_MT_TRACKING_ID, -1),
+                (TP, EV_ABS, ABS_MT_SLOT, 1), (TP, EV_ABS, ABS_MT_TRACKING_ID, -1),
+                (TP, EV_KEY, BTN_TOUCH, 0), (TP, EV_KEY, BTN_TOOL_DOUBLETAP, 0),
+                (TP, EV_SYN, SYN_REPORT, 0)]
+
+    def _tp_move(self, code, value):
+        out = []
+        if not self.touching:
+            out += self._tp_down()      # touch down lazily, on the first movement
+        self.lift_deadline = None
+        # Fingers follow the mouse. With GNOME's touchpad natural scrolling (on by
+        # default) that makes the page follow your hand.
+        sign = 1 if self.cfg.pan_follow_hand else -1
+        idx = 0 if code == REL_X else 1
+        self.tp_rem[idx] += sign * value * self.cfg.touchpad_speed
+        units = int(self.tp_rem[idx])
+        if units == 0:
+            return out
+        self.tp_rem[idx] -= units
+        new = self.tp_pos[idx] + units
+        hi = TP_MAX - TP_MARGIN - (TP_GAP if idx == 0 else 0)
+        if not TP_MARGIN <= new <= hi:  # near an edge: lift and grab again at the centre
+            out += self._tp_up() + self._tp_down()
+            new = self.tp_pos[idx] + units
+        self.tp_pos[idx] = new
+        return out + self._tp_frame() + [(TP, EV_SYN, SYN_REPORT, 0)]
 
     # -- wheel --
     def _wheel(self, code, value):
@@ -413,7 +582,26 @@ def main():
     ap.add_argument("--config", default="/etc/lxmbc.conf")
     ap.add_argument("--debug", action="store_true", help="log every state change")
     ap.add_argument("--list", action="store_true", help="list input devices and exit")
+    ap.add_argument("--upgrade-config", metavar="EXAMPLE", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.upgrade_config:         # used by install.sh, once, on old-style configs
+        with open(args.upgrade_config) as f:
+            example = f.read()
+        with open(args.config) as f:
+            if CONFIG_FORMAT_MARKER in f.read():
+                print(f"{args.config} is already in the current format, nothing to do.")
+                return
+        text, kept = upgrade_config(args.config, example)
+        os.replace(args.config, args.config + ".bak")
+        with open(args.config, "w") as f:
+            f.write(text)
+        os.chmod(args.config, 0o644)
+        changed = ", ".join(f"{k} = {v}" for k, v in kept.items()) or "none (all defaults)"
+        print(f"Converted {args.config} to the new format (old file: {args.config}.bak).")
+        print(f"Your settings that differ from the defaults: {changed}")
+        return
+
     cfg = load_config(args.config, args.debug)
 
     try:
@@ -435,7 +623,19 @@ def main():
         name="lxmbc virtual mouse")
     kbd_ui = evdev.UInput({EV_KEY: list(range(1, 249))}, name="lxmbc virtual keyboard")
     outputs = {MOUSE: mouse_ui, KBD: kbd_ui}
-    dirty = {MOUSE: False, KBD: False}
+    if cfg.pan_mode == "touchpad":
+        ai = evdev.AbsInfo
+        outputs[TP] = evdev.UInput(
+            {EV_KEY: [BTN_LEFT, BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP],
+             EV_ABS: [(ABS_X, ai(TP_CENTER, 0, TP_MAX, 0, 0, TP_RES)),
+                      (ABS_Y, ai(TP_CENTER, 0, TP_MAX, 0, 0, TP_RES)),
+                      (ABS_MT_SLOT, ai(0, 0, 1, 0, 0, 0)),
+                      (ABS_MT_POSITION_X, ai(TP_CENTER, 0, TP_MAX, 0, 0, TP_RES)),
+                      (ABS_MT_POSITION_Y, ai(TP_CENTER, 0, TP_MAX, 0, 0, TP_RES)),
+                      (ABS_MT_TRACKING_ID, ai(0, 0, 65535, 0, 0, 0))]},
+            name="lxmbc virtual touchpad",
+            input_props=[INPUT_PROP_POINTER, INPUT_PROP_BUTTONPAD])
+    dirty = {t: False for t in outputs}
 
     def emit(events):
         for target, etype, code, value in events:
@@ -494,9 +694,17 @@ def main():
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, on_term)
+    if not os.path.exists(args.config):
+        log(f"no config file at {args.config}, using defaults")
+    else:
+        changed = ", ".join(f"{k} = {v}" for k, v in cfg.overrides.items()) or "none"
+        log(f"config {args.config}: changed from defaults: {changed}")
+    for key in cfg.unknown:
+        log(f"WARNING: unknown setting {key!r} in {args.config} (typo?), ignored")
     log(f"lxmbc running: chord_ms={cfg.chord_ms} chord_move_threshold={cfg.chord_move_threshold} "
         f"move_threshold={cfg.move_threshold} "
-        f"pan_speed={cfg.pan_speed} pan_follow_hand={cfg.pan_follow_hand} "
+        f"pan_mode={cfg.pan_mode} pan_speed={cfg.pan_speed} touchpad_speed={cfg.touchpad_speed} "
+        f"pan_follow_hand={cfg.pan_follow_hand} pan_move_cursor={cfg.pan_move_cursor} "
         f"back_hold_ms={cfg.back_hold_ms} devices={cfg.devices or 'all mice'}")
 
     next_scan = 0.0
@@ -533,8 +741,8 @@ def main():
     finally:
         for fd in list(devices):
             drop(fd)
-        mouse_ui.close()
-        kbd_ui.close()
+        for ui in outputs.values():
+            ui.close()
         log("lxmbc stopped, mice released")
 
 
